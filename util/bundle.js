@@ -10,9 +10,12 @@ const globby = require("globby");
 const nanomatch = require("nanomatch");
 const { traceFiles } = require("trace-deps");
 const { findProdInstalls } = require("inspectdep");
+const { readJson } = require("inspectdep/lib/util");
 
 const IS_WIN = process.platform === "win32";
 const EPOCH = new Date(0);
+
+const ROOT_PACKAGE_NAME = "__root__";
 
 const GLOBBY_OPTS = {
   dot: true,
@@ -84,7 +87,8 @@ const resolveFilePathsFromPatterns = async ({
   preInclude,
   depInclude,
   include,
-  exclude
+  exclude,
+  requestedPackagesMap = new Map()
 }) => {
   // ==========================================================================
   // **Phase One** (`globby()`): Read files from disk into a list of files.
@@ -96,6 +100,11 @@ const resolveFilePathsFromPatterns = async ({
   // excluded manually by `nanomatch` after. We get the same result here
   // without reading from disk.
   const globInclude = ["**"]
+    .concat(
+      Array.from(requestedPackagesMap.values())
+        .filter((packageObj) => packageObj.relativePath)
+        .map((packageObj) => `${packageObj.relativePath}/**`)
+    )
     // Start with Jetpack custom preInclude
     .concat(preInclude || [])
     // ... hone to the production node_modules
@@ -144,48 +153,206 @@ const resolveFilePathsFromPatterns = async ({
   };
 };
 
-const createDepInclude = async ({ cwd, rootPath, roots }) => {
-  // Dependency roots.
-  let depRoots = roots;
-  if (!depRoots) {
-    // Special case: Allow `{CWD}/package.json` to not exist. Any `roots` must.
-    const cwdPkgExists = await exists(path.join(cwd, "package.json"));
-    depRoots = cwdPkgExists ? [cwd] : [];
+const getPathParts = (somePath) => {
+  if (!somePath) {
+    return somePath;
   }
 
-  return Promise
-    // Find the production install paths
-    .all(depRoots
-      // Sort for proper glob order.
-      .sort()
-      // Do async + individual root stuff.
-      .map((curPath) => findProdInstalls({ rootPath, curPath })
-        .then((deps) => []
-          // Dependency root-level exclude (relative to dep root, not root-path + dep)
-          .concat([`!${path.relative(cwd, path.join(curPath, "node_modules", "**"))}`])
-          // All other includes.
-          .concat(deps
-            // Relativize to root path for inspectdep results, the cwd for glob.
-            .map((dep) => path.relative(cwd, path.join(rootPath, dep)))
-            // Sort for proper glob order.
-            .sort()
-            // 1. Convert to `PATH/**` glob.
-            // 2. Add excludes for node_modules in every discovered pattern dep
-            //    dir. This allows us to exclude devDependencies because
-            //    **later** include patterns should have all the production deps
-            //    already and override.
-            .map((dep) => dep.indexOf(path.join("node_modules", ".bin")) === -1
-              ? [path.join(dep, "**"), `!${path.join(dep, "node_modules", "**")}`]
-              : [dep] // **don't** glob bin path (`ENOTDIR: not a directory`)
-            )
-            // Flatten the temp arrays we just introduced.
-            .reduce((m, a) => m.concat(a), [])
-          )
+  const pathParts = somePath.split(/[\/\\]/);
+
+  const firstMeaningPartIndex = pathParts.findIndex(
+    (part) => part && part !== "." && part !== ".." && part !== "node_modules"
+  );
+  if (firstMeaningPartIndex === -1) {
+    return null;
+  }
+
+  const prefixParts = pathParts.slice(0, firstMeaningPartIndex);
+  const isDependency = prefixParts[prefixParts.length - 1] === "node_modules";
+  const prefixPath = prefixParts.join("/");
+  const meaningParts = pathParts.slice(firstMeaningPartIndex);
+
+  // If first symbol of dep name is @ then it's scoped dep, we should take next too
+  if (isDependency && meaningParts[0][0] === "@") {
+    return {
+      parentName: `${meaningParts[0]}/${meaningParts[1]}`,
+      // eslint-disable-next-line no-magic-numbers
+      childPath: meaningParts.slice(2).join("/"),
+      prefixPath,
+      isDependency
+    };
+  }
+
+  return {
+    parentName: meaningParts[0],
+    // eslint-disable-next-line no-magic-numbers
+    childPath: meaningParts.slice(1).join("/"),
+    prefixPath,
+    isDependency
+  };
+};
+
+const createPackageDepInclude = async ({ cwd, rootPath, packagePath, packagesMap }) => {
+  const depsByPackage = {
+    packages: new Set(),
+    external: []
+  };
+
+  // All deps of the package
+  const deps = await findProdInstalls({ rootPath, curPath: packagePath });
+
+  // Splitting packages and external deps
+  await Promise.all(
+    deps.map(async (dep) => {
+      const depPath = path.join(rootPath, dep);
+      const depParts = getPathParts(path.relative(packagePath, depPath));
+
+      // If it's valid dependency path
+      if (depParts) {
+        const { parentName: directDepName, childPath: childFilePath } = depParts;
+
+        // If it's a package, manage it separately
+        if (packagesMap.has(directDepName) && packagesMap.get(directDepName).type === "package") {
+          // If it's a package directory itself, add the package to the requested set
+          if (!childFilePath) {
+            depsByPackage.packages.add(directDepName);
+          }
+
+          return;
+        }
+      }
+
+      // Relativize to root path for inspectdep results, the cwd for glob.
+      depsByPackage.external.push(path.relative(cwd, depPath));
+    })
+  );
+
+  return depsByPackage;
+};
+
+const determineRequestedPackages = ({ roots, packagesMap, depsMapByPackage }) => {
+  const requestedPackages = new Map();
+
+  // It is stack for package names to lookup, and cwd is the default package to lookup
+  const packagesToLookup = [];
+
+  const cwdPackageDeps = depsMapByPackage.get(ROOT_PACKAGE_NAME);
+
+  if (cwdPackageDeps) {
+    const packageObj = packagesMap.get(ROOT_PACKAGE_NAME);
+
+    packageObj.deps = cwdPackageDeps;
+    requestedPackages.set(ROOT_PACKAGE_NAME, packageObj);
+    packagesToLookup.push(ROOT_PACKAGE_NAME);
+  }
+
+  if (roots && roots.length) {
+    roots.forEach((childRootPath) => {
+      const packageObj = packagesMap.get(childRootPath);
+      const childRootDeps = depsMapByPackage.get(packageObj.name);
+
+      if (childRootDeps) {
+        packageObj.deps = childRootDeps;
+        requestedPackages.set(packageObj.name, packageObj);
+        packagesToLookup.push(packageObj.name);
+      }
+    });
+  }
+
+  // While there are packages to lookup and not all package are found
+  while (packagesToLookup.length && requestedPackages.size !== packagesMap.size) {
+    const packageToLookup = packagesToLookup.shift();
+    const packageDeps = depsMapByPackage.get(packageToLookup);
+
+    // Find every package that is not looked up yet but requested and add it to the stack
+    packageDeps.packages.forEach((packageName) => {
+      if (!requestedPackages.has(packageName)) {
+        const packageObj = packagesMap.get(packageName);
+
+        packageObj.deps = depsMapByPackage.get(packageName);
+        requestedPackages.set(packageName, packageObj);
+        packagesToLookup.push(packageName);
+      }
+    });
+  }
+
+  return requestedPackages;
+};
+
+const buildDepsList = (requestedPackages) => {
+  let depsList = [];
+
+  requestedPackages.forEach(({ relativePath: packagePath, deps: packageDeps }) => {
+    const packageDepsList = []
+      // Dependency root-level exclude (relative to dep root, not root-path + dep)
+      .concat([`!${path.join(packagePath, "node_modules", "**")}`])
+      // All other includes.
+      .concat(packageDeps.external
+        // Sort for proper glob order.
+        .sort()
+        // 1. Convert to `PATH/**` glob.
+        // 2. Add excludes for node_modules in every discovered pattern dep
+        //    dir. This allows us to exclude devDependencies because
+        //    **later** include patterns should have all the production deps
+        //    already and override.
+        .map((dep) => dep.indexOf(path.join("node_modules", ".bin")) === -1
+          ? [path.join(dep, "**"), `!${path.join(dep, "node_modules", "**")}`]
+          : [dep] // **don't** glob bin path (`ENOTDIR: not a directory`)
         )
-      )
-    )
-    // Flatten to final list with base default patterns applied.
-    .then((depsList) => depsList.reduce((m, a) => m.concat(a), []));
+        // Flatten the temp arrays we just introduced.
+        .reduce((m, a) => m.concat(a), [])
+      );
+
+    depsList = depsList.concat(packageDepsList);
+  });
+
+  return depsList;
+};
+
+const createDepInclude = async ({ cwd, rootPath, roots, packages, packagesMap }) => {
+  // Special case: Allow `{CWD}/package.json` to not exist. Any `roots` must.
+  const cwdPkgExists = await exists(path.join(cwd, "package.json"));
+
+  const includedPackages = new Set();
+  if (cwdPkgExists) {
+    includedPackages.add(cwd);
+  }
+  if (roots && roots.length) {
+    roots.forEach((childRootPath) => { includedPackages.add(childRootPath); });
+  }
+  if (packages && packages.length) {
+    packages.forEach((packagePath) => { includedPackages.add(packagePath); });
+  }
+
+  const depsMapByPackage = new Map();
+
+  await Promise.all(
+    Array.from(includedPackages).sort().map(async (packagePath) => {
+      const packageObj = packagesMap.get(packagePath);
+      const depsByPackage = await createPackageDepInclude({
+        cwd,
+        rootPath,
+        packagePath,
+        packagesMap
+      });
+
+      depsMapByPackage.set(packageObj.name, depsByPackage);
+    })
+  );
+
+  const requestedPackages = determineRequestedPackages({
+    cwd,
+    roots,
+    packagesMap,
+    depsMapByPackage
+  });
+
+  const depsList = buildDepsList(requestedPackages);
+
+  return {
+    deps: depsList,
+    requestedPackages
+  };
 };
 
 // Extra highest level node_modules package.
@@ -375,9 +542,14 @@ const findCollapsed = async ({ files, cwd }) => {
   };
 };
 
-const createZip = async ({ files, cwd, bundlePath }) => {
+const createZip = async ({ files, requestedPackagesMap, cwd, bundlePath }) => {
   // Sort by name (mutating) to make deterministic.
   files.sort();
+
+  const requestedPackagesMapByPath = new Map();
+  requestedPackagesMap.forEach((requestedPackage) => {
+    requestedPackagesMapByPath.set(requestedPackage.relativePath, requestedPackage);
+  });
 
   // Get all contents.
   //
@@ -385,11 +557,24 @@ const createZip = async ({ files, cwd, bundlePath }) => {
   // consider a more concurrency-optimized solution.
   // https://github.com/FormidableLabs/serverless-jetpack/issues/75
   const fileObjs = await Promise.all(files.map(
-    (name) => Promise.all([
-      readFile(path.join(cwd, name)),
-      readStat(path.join(cwd, name))
-    ])
-      .then(([data, stat]) => ({ name, data, stat }))
+    (name) => {
+      const pathParts = getPathParts(name);
+
+      let relatedPackage;
+      if (pathParts && !pathParts.isDependency) {
+        const parentPath = path.join(pathParts.prefixPath, pathParts.parentName);
+        relatedPackage = requestedPackagesMapByPath.get(parentPath);
+      }
+      if (!relatedPackage) {
+        relatedPackage = requestedPackagesMap.get(ROOT_PACKAGE_NAME);
+      }
+
+      return Promise.all([
+        readFile(path.join(cwd, name)),
+        readStat(path.join(cwd, name))
+      ])
+        .then(([data, stat]) => ({ name, pathParts, relatedPackage, data, stat }));
+    }
   ));
 
   // Use Serverless-analogous library + logic to create zipped artifact.
@@ -418,22 +603,111 @@ const createZip = async ({ files, cwd, bundlePath }) => {
       // - Sort and append files in sorted order.
       //
       // See: https://github.com/serverless/serverless/blob/master/lib/plugins/package/lib/zipService.js#L91-L104
-      fileObjs.forEach(({ name, data, stat: { mode } }) => {
+      fileObjs.forEach(({ name, pathParts, relatedPackage, data, stat: { mode } }) => {
+        let depName = name;
+        if (
+          relatedPackage
+          && relatedPackage.name !== ROOT_PACKAGE_NAME
+          && relatedPackage.type === "package"
+        ) {
+          depName = path.join("packages", relatedPackage.name, pathParts.childPath);
+        }
+
         // We originally did `zip.file` which is more I/O efficient, but doesn't
         // guarantee order. So we manually read files above in one fell swoop
         // into memory to insert in deterministic order.
         //
         // https://github.com/FormidableLabs/serverless-jetpack/issues/7
         zip.append(data, {
-          name,
+          name: depName,
           mode,
           date: EPOCH
+        });
+      });
+
+      requestedPackagesMap.forEach((packageObj, packageName) => {
+        packageObj.deps.packages.forEach((childPackageName) => {
+          const childPackageObj = requestedPackagesMap.get(childPackageName);
+
+          let destinationPathPrefix;
+          if (packageObj.relativePath) {
+            destinationPathPrefix = "../..";
+          } else {
+            destinationPathPrefix = "../packages";
+          }
+
+          if (childPackageObj.scoped) {
+            destinationPathPrefix = path.join("..", destinationPathPrefix);
+          }
+
+          zip.symlink(
+            path.join(
+              packageObj.relativePath && path.join("packages", packageName),
+              "node_modules", childPackageName
+            ),
+            path.join(destinationPathPrefix, childPackageName)
+          );
         });
       });
 
       zip.finalize();
     });
   });
+};
+
+const createPackageMap = async ({ cwd, roots, packages }) => {
+  const packagesMap = new Map();
+
+  const cwdPackageObj = {
+    name: ROOT_PACKAGE_NAME,
+    type: "root",
+    scoped: false,
+    fullPath: cwd,
+    relativePath: ""
+  };
+  packagesMap.set(ROOT_PACKAGE_NAME, cwdPackageObj);
+  packagesMap.set(cwd, cwdPackageObj);
+
+  if (roots) {
+    await Promise.all(
+      roots.map(async (childRootPath) => {
+        if (packagesMap.has(childRootPath)) { return; }
+
+        const pkg = await readJson(path.resolve(childRootPath, "package.json"));
+
+        const childRootPackageObj = {
+          name: pkg.name,
+          type: "root",
+          scoped: pkg.name[0] === "@",
+          fullPath: childRootPath,
+          relativePath: path.relative(cwd, childRootPath)
+        };
+        packagesMap.set(pkg.name, childRootPackageObj);
+        packagesMap.set(childRootPath, childRootPackageObj);
+      })
+    );
+  }
+  if (packages) {
+    await Promise.all(
+      packages.map(async (packagePath) => {
+        if (packagesMap.has(packagePath)) { return; }
+
+        const pkg = await readJson(path.resolve(packagePath, "package.json"));
+
+        const packageObj = {
+          name: pkg.name,
+          type: "package",
+          scoped: pkg.name[0] === "@",
+          fullPath: packagePath,
+          relativePath: path.relative(cwd, packagePath)
+        };
+        packagesMap.set(pkg.name, packageObj);
+        packagesMap.set(packagePath, packageObj);
+      })
+    );
+  }
+
+  return packagesMap;
 };
 
 /**
@@ -484,6 +758,7 @@ const globAndZip = async ({
   servicePath,
   base,
   roots,
+  packages,
   bundleName,
   traceParams = {},
   preInclude,
@@ -497,12 +772,16 @@ const globAndZip = async ({
   // Fully resolve paths.
   cwd = path.resolve(servicePath, cwd);
   roots = roots ? roots.map((r) => path.resolve(servicePath, r)) : roots;
+  packages = packages ? packages.map((r) => path.resolve(servicePath, r)) : packages;
   const rootPath = path.resolve(servicePath, base);
   const bundlePath = path.resolve(servicePath, bundleName);
 
   // Remove all cwd-relative-root node_modules first. Trace/package modes will
   // then bring `node_modules` individual files back in after.
-  let depInclude = ["!node_modules/**"];
+  let depInclude;
+  let requestedPackagesMap = new Map();
+  let packagesMap = new Map();
+
   let traceMisses = mapTraceMisses();
   if (traceInclude) {
     // [Trace Mode] Trace and introspect all individual dependency files.
@@ -512,20 +791,23 @@ const globAndZip = async ({
     const traced = await traceFiles({ ...traceParams, srcPaths });
     traceMisses = mapTraceMisses({ traced, servicePath });
 
-    depInclude = depInclude
+    depInclude = ["!node_modules/**"]
       .concat(srcPaths, traced.dependencies)
       // Convert to relative paths and include in patterns for bundling.
       .map((depPath) => path.relative(servicePath, depPath));
   } else {
+    packagesMap = await createPackageMap({ cwd, roots, packages });
+
     // [Dependency Mode] Iterate all dependency roots to gather production dependencies.
-    depInclude = depInclude.concat(
-      await createDepInclude({ cwd, rootPath, roots })
-    );
+    ({
+      deps: depInclude,
+      requestedPackages: requestedPackagesMap
+    } = await createDepInclude({ cwd, rootPath, roots, packages, packagesMap }));
   }
 
   // Glob and filter all files in package.
   const { included, excluded } = await resolveFilePathsFromPatterns(
-    { cwd, servicePath, preInclude, depInclude, include, exclude }
+    { cwd, servicePath, preInclude, depInclude, include, exclude, requestedPackagesMap }
   );
 
   // Detect collapsed duplicates.
@@ -535,6 +817,8 @@ const globAndZip = async ({
   // Create package zip.
   await bundle.createZip({
     files: included,
+    packagesMap,
+    requestedPackagesMap,
     cwd,
     bundlePath
   });

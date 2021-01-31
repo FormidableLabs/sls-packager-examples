@@ -203,6 +203,7 @@ class Jetpack {
 
   // Function, layer overrides, etc.
   // eslint-disable-next-line complexity
+  // eslint-disable-next-line max-statements,complexity
   _extraOptions({ functionObject, layerObject }) {
     if (!functionObject && !layerObject) {
       return this._serviceOptions;
@@ -218,6 +219,12 @@ class Jetpack {
       opts.roots = (opts.roots || [])
         .concat(fnOpts.roots || [])
         .concat(layerOpts.roots || []);
+    }
+
+    if (fnOpts.packages || layerOpts.packages) {
+      opts.packages = (opts.packages || [])
+        .concat(fnOpts.packages || [])
+        .concat(layerOpts.packages || []);
     }
 
     if (fnOpts.collapsed || layerOpts.collapsed) {
@@ -365,7 +372,7 @@ class Jetpack {
       // Find all the handler files in preference order.
       .all(handlers.map(async (handler) => {
         // We extract handler file name pretty analogously to how serverless does it.
-        let pattern = handler.replace(/\.[^\.]+$/, "");
+        let pattern = handler.replace(/\.[^.]+$/, "");
         // Add pattern glob if not already present.
         if (!(/\.(js|mjs)$/).test(pattern)) {
           pattern += ".{js,mjs}";
@@ -739,7 +746,12 @@ class Jetpack {
     const layerPath = (layerObject || {}).path;
     const cwd = layerPath ? path.relative(servicePath, layerPath) : servicePath;
 
-    const { base, roots, preInclude } = this._extraOptions({ functionObject, layerObject });
+    const {
+      base,
+      roots,
+      packages,
+      preInclude
+    } = this._extraOptions({ functionObject, layerObject });
     const { include, exclude } = this.filePatterns({ functionObject, layerObject });
 
     const buildFn = worker ? worker.globAndZip : globAndZip;
@@ -748,6 +760,7 @@ class Jetpack {
       servicePath,
       base,
       roots,
+      packages,
       bundleName,
       traceParams,
       preInclude,
